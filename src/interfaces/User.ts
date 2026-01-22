@@ -25,7 +25,9 @@ export interface UserActivityInterface {
     profileImageOptimized: string;
     bot: boolean;
     botExcutedTime: number;
-    myBoughtSize?: number; // Tracks actual tokens we bought
+    myBoughtSize?: number; // Tracks actual tokens we bought (un-sold ledger)
+    mySize?: number;       // The actual size (tokens) the bot executed
+    myUsdcSize?: number;   // The actual USDC value the bot executed
 }
 
 export interface UserPositionInterface {

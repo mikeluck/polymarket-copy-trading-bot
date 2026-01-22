@@ -62,7 +62,9 @@ const activitySchema = new Schema({
     profileImageOptimized: { type: String, required: false },
     bot: { type: Boolean, required: false },
     botExcutedTime: { type: Number, required: false },
-    myBoughtSize: { type: Number, required: false }, // Tracks actual tokens we bought
+    myBoughtSize: { type: Number, required: false }, // Tracks actual tokens we bought (un-sold ledger)
+    mySize: { type: Number, required: false },       // The actual size (tokens) the bot executed
+    myUsdcSize: { type: Number, required: false },   // The actual USDC value the bot executed
 });
 
 const getUserPositionModel = (walletAddress: string) => {

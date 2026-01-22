@@ -7,6 +7,9 @@ const USDC_CONTRACT_ADDRESS = ENV.USDC_CONTRACT_ADDRESS;
 const USDC_ABI = ['function balanceOf(address owner) view returns (uint256)'];
 
 const getMyBalance = async (address: string): Promise<number> => {
+    if (ENV.PAPER_TRADING) {
+        return ENV.PAPER_TRADING_BALANCE;
+    }
     const rpcProvider = new ethers.providers.JsonRpcProvider(RPC_URL);
     const usdcContract = new ethers.Contract(USDC_CONTRACT_ADDRESS, USDC_ABI, rpcProvider);
     const balance_usdc = await usdcContract.balanceOf(address);

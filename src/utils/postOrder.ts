@@ -201,6 +201,22 @@ const postOrder = async (
         let abortDueToFunds = false;
         let totalBoughtTokens = 0; // Track total tokens bought for this trade
 
+        if (ENV.PAPER_TRADING) {
+            const tokensBought = orderCalc.finalAmount / trade.price;
+            totalBoughtTokens = tokensBought;
+            Logger.info(`🧪 [PAPER TRADING] Simulated BUY of $${orderCalc.finalAmount.toFixed(2)} at $${trade.price} (${tokensBought.toFixed(2)} tokens)`);
+            await UserActivity.updateOne(
+                { _id: trade._id },
+                {
+                    bot: true,
+                    myBoughtSize: totalBoughtTokens,
+                    mySize: totalBoughtTokens,
+                    myUsdcSize: orderCalc.finalAmount
+                }
+            );
+            return;
+        }
+
         while (remaining > 0 && retry < RETRY_LIMIT) {
             const orderBook = await clobClient.getOrderBook(trade.asset);
             if (!orderBook.asks || orderBook.asks.length === 0) {
@@ -243,11 +259,19 @@ const postOrder = async (
             };
 
             Logger.info(
-                `Creating order: $${orderSize.toFixed(2)} @ $${minPriceAsk.price} (Balance: $${my_balance.toFixed(2)})`
+                `${ENV.PAPER_TRADING ? '[PAPER] ' : ''}Creating order: $${orderSize.toFixed(2)} @ $${minPriceAsk.price} (Balance: $${my_balance.toFixed(2)})`
             );
-            // Order args logged internally
-            const signedOrder = await clobClient.createMarketOrder(order_arges);
-            const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+
+            let resp;
+            if (ENV.PAPER_TRADING) {
+                // Simulate successful order
+                resp = { success: true };
+                Logger.info(`🧪 [PAPER TRADING] Simulated BUY of $${orderSize.toFixed(2)} at $${minPriceAsk.price}`);
+            } else {
+                // Order args logged internally
+                const signedOrder = await clobClient.createMarketOrder(order_arges);
+                resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+            }
             if (resp.success === true) {
                 retry = 0;
                 const tokensBought = order_arges.amount / order_arges.price;
@@ -256,6 +280,18 @@ const postOrder = async (
                     true,
                     `Bought $${order_arges.amount.toFixed(2)} at $${order_arges.price} (${tokensBought.toFixed(2)} tokens)`
                 );
+
+                // Update DB with bot's specific execution size
+                await UserActivity.updateOne(
+                    { _id: trade._id },
+                    {
+                        $set: {
+                            mySize: totalBoughtTokens,
+                            myUsdcSize: totalBoughtTokens * trade.price // Using current execution price
+                        }
+                    }
+                );
+
                 remaining -= order_arges.amount;
             } else {
                 const errorMessage = extractOrderError(resp);
@@ -396,6 +432,51 @@ const postOrder = async (
         let abortDueToFunds = false;
         let totalSoldTokens = 0; // Track total tokens sold
 
+        if (ENV.PAPER_TRADING) {
+            totalSoldTokens = remaining;
+            const myExecutedUsdcSize = totalSoldTokens * trade.price;
+            Logger.info(`🧪 [PAPER TRADING] Simulated SELL of ${remaining.toFixed(2)} tokens at $${trade.price} ($${myExecutedUsdcSize.toFixed(2)})`);
+            await UserActivity.updateOne(
+                { _id: trade._id },
+                {
+                    bot: true,
+                    mySize: totalSoldTokens,
+                    myUsdcSize: myExecutedUsdcSize
+                }
+            );
+
+            // Re-apply tracking logic for paper trading to ensure future sells work correctly
+            if (totalSoldTokens > 0 && totalBoughtTokens > 0) {
+                const sellPercentage = totalSoldTokens / totalBoughtTokens;
+                if (sellPercentage >= 0.99) {
+                    await UserActivity.updateMany(
+                        {
+                            asset: trade.asset,
+                            conditionId: trade.conditionId,
+                            side: 'BUY',
+                            bot: true,
+                            myBoughtSize: { $exists: true, $gt: 0 },
+                        },
+                        { $set: { myBoughtSize: 0 } }
+                    );
+                    Logger.info(`🧹 [PAPER] Cleared purchase tracking`);
+                } else {
+                    for (const buy of previousBuys) {
+                        const newSize = (buy.myBoughtSize || 0) * (1 - sellPercentage);
+                        await UserActivity.updateOne(
+                            { _id: buy._id },
+                            { $set: { myBoughtSize: newSize } }
+                        );
+                    }
+                    Logger.info(`📝 [PAPER] Updated purchase tracking`);
+                }
+            }
+
+            remaining = 0;
+            // Return early to skip the real trading while loop
+            return;
+        }
+
         while (remaining > 0 && retry < RETRY_LIMIT) {
             const orderBook = await clobClient.getOrderBook(trade.asset);
             if (!orderBook.bids || orderBook.bids.length === 0) {
@@ -436,9 +517,17 @@ const postOrder = async (
                 amount: sellAmount,
                 price: parseFloat(maxPriceBid.price),
             };
-            // Order args logged internally
-            const signedOrder = await clobClient.createMarketOrder(order_arges);
-            const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+
+            let resp;
+            if (ENV.PAPER_TRADING) {
+                // Simulate successful order
+                resp = { success: true };
+                Logger.info(`🧪 [PAPER TRADING] Simulated SELL of ${sellAmount.toFixed(2)} tokens at $${maxPriceBid.price}`);
+            } else {
+                // Order args logged internally
+                const signedOrder = await clobClient.createMarketOrder(order_arges);
+                resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+            }
             if (resp.success === true) {
                 retry = 0;
                 totalSoldTokens += order_arges.amount;
@@ -446,6 +535,18 @@ const postOrder = async (
                     true,
                     `Sold ${order_arges.amount} tokens at $${order_arges.price}`
                 );
+
+                // Update DB with bot's specific execution size
+                await UserActivity.updateOne(
+                    { _id: trade._id },
+                    {
+                        $set: {
+                            mySize: totalSoldTokens,
+                            myUsdcSize: totalSoldTokens * trade.price
+                        }
+                    }
+                );
+
                 remaining -= order_arges.amount;
             } else {
                 const errorMessage = extractOrderError(resp);

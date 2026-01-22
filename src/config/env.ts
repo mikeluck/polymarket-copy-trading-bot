@@ -348,4 +348,7 @@ export const ENV = {
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,
+    // Paper trading / Simulation mode
+    PAPER_TRADING: process.env.PAPER_TRADING === 'true',
+    PAPER_TRADING_BALANCE: parseFloat(process.env.PAPER_TRADING_BALANCE || '1000.0'),
 };
