@@ -17,6 +17,7 @@
         "transfer-to-gnosis": "ts-node src/scripts/transferPositionsToGnosisSafe.ts",
         "fetch-history": "ts-node src/scripts/fetchHistoricalTrades.ts",
         "simulate": "ts-node src/scripts/simulateProfitability.ts",
+        "simulate-realistic": "ts-node src/scripts/simulateProfitabilityRealistic.ts",
         "simulate-old": "ts-node src/scripts/simulateProfitabilityOldLogic.ts",
         "sim": "ts-node src/scripts/runSimulations.ts",
         "compare": "ts-node src/scripts/compareResults.ts",

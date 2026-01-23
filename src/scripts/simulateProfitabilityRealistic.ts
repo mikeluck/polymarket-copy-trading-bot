@@ -40,6 +40,28 @@ interface Position {
     unrealizedPnl: number;
 }
 
+interface SimulatedPosition {
+    market: string;
+    outcome: string;
+    sharesHeld: number;
+    entryPrice: number;
+    exitPrice: number | null;
+    invested: number;
+    currentValue: number;
+    pnl: number;
+    closed: boolean;
+    trades: {
+        timestamp: number;
+        side: 'BUY' | 'SELL';
+        traderPrice: number; // Trader's price
+        yourPrice: number; // Your simulated price (with slippage)
+        size: number;
+        usdcSize: number;
+        slippagePercent: number;
+        slippageCost: number;
+    }[];
+}
+
 interface SimulationResult {
     id: string;
     name: string;
@@ -57,28 +79,9 @@ interface SimulationResult {
     unrealizedPnl: number;
     totalPnl: number;
     roi: number;
+    totalSlippageCost: number;
+    avgSlippagePercent: number;
     positions: SimulatedPosition[];
-}
-
-interface SimulatedPosition {
-    market: string;
-    outcome: string;
-    sharesHeld: number; // Track actual shares owned
-    entryPrice: number;
-    exitPrice: number | null;
-    invested: number;
-    currentValue: number;
-    pnl: number;
-    closed: boolean;
-    trades: {
-        timestamp: number;
-        side: 'BUY' | 'SELL';
-        price: number;
-        size: number;
-        usdcSize: number;
-        traderPercent: number;
-        yourSize: number;
-    }[];
 }
 
 const DEFAULT_TRADER_ADDRESS = '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b';
@@ -95,19 +98,44 @@ const HISTORY_DAYS = (() => {
 })();
 const MULTIPLIER = ENV.TRADE_MULTIPLIER || 1.0;
 
+// Realistic simulation parameters
+const DETECTION_DELAY_SECONDS = (() => {
+    const raw = process.env.SIM_DELAY_SECONDS;
+    const value = raw ? Number(raw) : 10;
+    return Number.isFinite(value) && value >= 0 ? value : 10;
+})(); // Time between trader's trade and your detection
+
+const BASE_SLIPPAGE_PERCENT = (() => {
+    const raw = process.env.SIM_BASE_SLIPPAGE;
+    const value = raw ? Number(raw) : 1.5;
+    return Number.isFinite(value) && value >= 0 ? value : 1.5;
+})(); // Base slippage %
+
+const SLIPPAGE_PER_100USD = (() => {
+    const raw = process.env.SIM_SLIPPAGE_PER_100;
+    const value = raw ? Number(raw) : 0.5;
+    return Number.isFinite(value) && value >= 0 ? value : 0.5;
+})(); // Additional slippage per $100 order size
+
+const TRANSACTION_FEE_PERCENT = (() => {
+    const raw = process.env.SIM_FEE_PERCENT;
+    const value = raw ? Number(raw) : 0;
+    return Number.isFinite(value) && value >= 0 ? value : 0;
+})(); // Transaction fee %
+
 // Strategy configuration
 const STRATEGY = (() => {
     const raw = process.env.SIM_STRATEGY?.toUpperCase();
     if (raw === 'FIXED') return CopyStrategy.FIXED;
     if (raw === 'ADAPTIVE') return CopyStrategy.ADAPTIVE;
-    return CopyStrategy.PERCENTAGE; // default
+    return CopyStrategy.PERCENTAGE;
 })();
 
 const COPY_SIZE = (() => {
     const raw = process.env.SIM_COPY_SIZE || process.env.COPY_PERCENTAGE;
     const value = raw ? Number(raw) : (STRATEGY === CopyStrategy.FIXED ? 5.0 : 10.0);
     return Number.isFinite(value) && value > 0 ? value : (STRATEGY === CopyStrategy.FIXED ? 5.0 : 10.0);
-})(); // For PERCENTAGE: % of trader's order, for FIXED: $ amount per trade
+})();
 
 const MIN_ORDER_SIZE = (() => {
     const raw = process.env.SIM_MIN_ORDER_USD;
@@ -125,9 +153,8 @@ const MAX_TRADES_LIMIT = (() => {
     const raw = process.env.SIM_MAX_TRADES;
     const value = raw ? Number(raw) : 5000;
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : 5000;
-})(); // Limit on number of trades for quick testing
+})();
 
-// Build copy strategy config
 const COPY_CONFIG: CopyStrategyConfig = {
     strategy: STRATEGY,
     copySize: COPY_SIZE,
@@ -135,6 +162,42 @@ const COPY_CONFIG: CopyStrategyConfig = {
     maxOrderSizeUSD: MAX_ORDER_SIZE,
     minOrderSizeUSD: MIN_ORDER_SIZE,
 };
+
+/**
+ * Calculate realistic slippage based on order size
+ * Larger orders = more slippage
+ */
+function calculateSlippage(orderSize: number): number {
+    const sizeBasedSlippage = (orderSize / 100) * SLIPPAGE_PER_100USD;
+    return BASE_SLIPPAGE_PERCENT + sizeBasedSlippage;
+}
+
+/**
+ * Calculate the actual price you would get, accounting for slippage and delay
+ * BUY: You pay MORE than trader (price moves up)
+ * SELL: You receive LESS than trader (price moves down)
+ */
+function getRealisticPrice(traderPrice: number, side: 'BUY' | 'SELL', orderSize: number): {
+    yourPrice: number;
+    slippagePercent: number;
+} {
+    const slippagePercent = calculateSlippage(orderSize);
+
+    let yourPrice: number;
+    if (side === 'BUY') {
+        // Buying: price went up, you pay more
+        yourPrice = traderPrice * (1 + slippagePercent / 100);
+        // Cap at $1.00 (max price in prediction markets)
+        yourPrice = Math.min(yourPrice, 0.999);
+    } else {
+        // Selling: price went down, you receive less
+        yourPrice = traderPrice * (1 - slippagePercent / 100);
+        // Floor at $0.001 (min price)
+        yourPrice = Math.max(yourPrice, 0.001);
+    }
+
+    return { yourPrice, slippagePercent };
+}
 
 async function fetchBatch(offset: number, limit: number, sinceTimestamp: number): Promise<Trade[]> {
     const response = await axios.get(
@@ -187,22 +250,18 @@ async function fetchTraderActivity(): Promise<Trade[]> {
             )
         );
 
-        // Calculate timestamp for history window
         const sinceTimestamp = Math.floor((Date.now() - HISTORY_DAYS * 24 * 60 * 60 * 1000) / 1000);
 
-        // First, get a sample to estimate total
         const firstBatch = await fetchBatch(0, 100, sinceTimestamp);
         let allTrades: Trade[] = [...firstBatch];
 
         if (firstBatch.length === 100) {
-            // Need to fetch more - do it in parallel batches
             const batchSize = 100;
-            const maxParallel = 5; // 5 parallel requests at a time
+            const maxParallel = 5;
             let offset = 100;
             let hasMore = true;
 
             while (hasMore && allTrades.length < MAX_TRADES_LIMIT) {
-                // Create batch of parallel requests
                 const promises: Promise<Trade[]>[] = [];
                 for (let i = 0; i < maxParallel; i++) {
                     promises.push(fetchBatch(offset + i * batchSize, batchSize, sinceTimestamp));
@@ -226,7 +285,6 @@ async function fetchTraderActivity(): Promise<Trade[]> {
                     hasMore = false;
                 }
 
-                // Check limit
                 if (allTrades.length >= MAX_TRADES_LIMIT) {
                     console.log(
                         colors.yellow(
@@ -243,7 +301,7 @@ async function fetchTraderActivity(): Promise<Trade[]> {
         }
 
         const sortedTrades = allTrades.sort((a, b) => a.timestamp - b.timestamp);
-        console.log(colors.green(`✓ Fetched ${sortedTrades.length} trades from last 7 days`));
+        console.log(colors.green(`✓ Fetched ${sortedTrades.length} trades from last ${HISTORY_DAYS} days`));
 
         // Save to cache
         if (!fs.existsSync(cacheDir)) {
@@ -291,43 +349,58 @@ async function fetchTraderPositions(): Promise<Position[]> {
 }
 
 async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
-    console.log(colors.cyan('\n🎮 Starting simulation...\n'));
+    console.log(colors.cyan('\n🎮 Starting REALISTIC simulation...\n'));
+    console.log(colors.yellow(`⚠️  Simulation parameters:`));
+    console.log(colors.gray(`   Detection delay: ${DETECTION_DELAY_SECONDS}s`));
+    console.log(colors.gray(`   Base slippage: ${BASE_SLIPPAGE_PERCENT}%`));
+    console.log(colors.gray(`   Slippage per $100: +${SLIPPAGE_PER_100USD}%`));
+    console.log(colors.gray(`   Transaction fee: ${TRANSACTION_FEE_PERCENT}%\n`));
 
     let yourCapital = STARTING_CAPITAL;
     let totalInvested = 0;
     let copiedTrades = 0;
     let skippedTrades = 0;
+    let totalSlippageCost = 0;
+    let totalSlippagePercent = 0;
 
     const positions = new Map<string, SimulatedPosition>();
 
     for (const trade of trades) {
-        // Calculate order size using the strategy
         const calculation = calculateOrderSize(
             COPY_CONFIG,
             trade.usdcSize,
             yourCapital
         );
 
-        // Skip if below minimum or zero
         if (calculation.finalAmount === 0 || calculation.belowMinimum) {
             skippedTrades++;
             continue;
         }
 
         const orderSize = calculation.finalAmount;
-
         const positionKey = `${trade.asset}:${trade.outcome}`;
 
         if (trade.side === 'BUY') {
-            // BUY trade
-            const sharesReceived = orderSize / trade.price;
+            // Calculate realistic price with slippage
+            const { yourPrice, slippagePercent } = getRealisticPrice(trade.price, 'BUY', orderSize);
+            const sharesReceived = orderSize / yourPrice;
+            const slippageCost = orderSize * (slippagePercent / 100);
+
+            // Apply transaction fee
+            const feeAmount = orderSize * (TRANSACTION_FEE_PERCENT / 100);
+            const totalCost = orderSize + feeAmount;
+
+            if (totalCost > yourCapital) {
+                skippedTrades++;
+                continue;
+            }
 
             if (!positions.has(positionKey)) {
                 positions.set(positionKey, {
                     market: trade.market || trade.asset || 'Unknown market',
                     outcome: trade.outcome,
-                    sharesHeld: 0, // Initialize shares
-                    entryPrice: trade.price,
+                    sharesHeld: 0,
+                    entryPrice: yourPrice,
                     exitPrice: null,
                     invested: 0,
                     currentValue: 0,
@@ -339,26 +412,27 @@ async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
 
             const pos = positions.get(positionKey)!;
 
-            // Track shares properly
             pos.sharesHeld += sharesReceived;
-            pos.invested += orderSize;
-            pos.currentValue = pos.sharesHeld * trade.price;
+            pos.invested += totalCost;
+            pos.currentValue = pos.sharesHeld * yourPrice;
 
             pos.trades.push({
                 timestamp: trade.timestamp,
                 side: 'BUY',
-                price: trade.price,
+                traderPrice: trade.price,
+                yourPrice: yourPrice,
                 size: sharesReceived,
-                usdcSize: orderSize,
-                traderPercent: (trade.usdcSize / 100000) * 100, // Placeholder for display
-                yourSize: orderSize,
+                usdcSize: totalCost,
+                slippagePercent: slippagePercent,
+                slippageCost: slippageCost,
             });
 
-            yourCapital -= orderSize;
-            totalInvested += orderSize;
+            yourCapital -= totalCost;
+            totalInvested += totalCost;
+            totalSlippageCost += slippageCost;
+            totalSlippagePercent += slippagePercent;
             copiedTrades++;
         } else if (trade.side === 'SELL') {
-            // SELL trade
             if (positions.has(positionKey)) {
                 const pos = positions.get(positionKey)!;
 
@@ -367,34 +441,44 @@ async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
                     continue;
                 }
 
-                // Calculate proportional sell based on trader's order
+                // Estimate trader's sell percentage (still imperfect, but best we can do)
                 const traderSellShares = trade.usdcSize / trade.price;
-                const traderTotalShares = traderSellShares / 0.1; // Estimate (we don't know trader's exact position)
+                const traderTotalShares = traderSellShares / 0.1; // Rough estimate
                 const traderSellPercent = Math.min(traderSellShares / traderTotalShares, 1.0);
 
-                // Sell same proportion of our shares
                 const sharesToSell = Math.min(pos.sharesHeld * traderSellPercent, pos.sharesHeld);
-                const sellAmount = sharesToSell * trade.price;
+
+                // Calculate realistic sell price with slippage
+                const estimatedSellValue = sharesToSell * trade.price;
+                const { yourPrice, slippagePercent } = getRealisticPrice(trade.price, 'SELL', estimatedSellValue);
+                const sellAmount = sharesToSell * yourPrice;
+                const slippageCost = estimatedSellValue * (slippagePercent / 100);
+
+                // Apply transaction fee
+                const feeAmount = sellAmount * (TRANSACTION_FEE_PERCENT / 100);
+                const netSellAmount = sellAmount - feeAmount;
 
                 pos.sharesHeld -= sharesToSell;
-                pos.currentValue = pos.sharesHeld * trade.price;
-                pos.exitPrice = trade.price;
+                pos.currentValue = pos.sharesHeld * yourPrice;
+                pos.exitPrice = yourPrice;
 
                 pos.trades.push({
                     timestamp: trade.timestamp,
                     side: 'SELL',
-                    price: trade.price,
+                    traderPrice: trade.price,
+                    yourPrice: yourPrice,
                     size: sharesToSell,
-                    usdcSize: sellAmount,
-                    traderPercent: traderSellPercent * 100,
-                    yourSize: sellAmount,
+                    usdcSize: netSellAmount,
+                    slippagePercent: slippagePercent,
+                    slippageCost: slippageCost,
                 });
 
-                yourCapital += sellAmount;
+                yourCapital += netSellAmount;
+                totalSlippageCost += slippageCost;
+                totalSlippagePercent += slippagePercent;
 
                 if (pos.sharesHeld < 0.01) {
                     pos.closed = true;
-                    // Calculate final P&L
                     const totalBought = pos.trades
                         .filter((t) => t.side === 'BUY')
                         .reduce((sum, t) => sum + t.usdcSize, 0);
@@ -411,7 +495,7 @@ async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
         }
     }
 
-    // Calculate current values based on trader's current positions
+    // Calculate current values
     const traderPositions = await fetchTraderPositions();
     let totalCurrentValue = yourCapital;
     let unrealizedPnl = 0;
@@ -419,13 +503,11 @@ async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
 
     for (const [key, simPos] of positions.entries()) {
         if (!simPos.closed) {
-            // Find matching trader position to get current value
             const assetId = key.split(':')[0];
             const traderPos = traderPositions.find((tp) => tp.asset === assetId);
 
             if (traderPos) {
                 const currentPrice = traderPos.currentValue / traderPos.size;
-                // Use tracked sharesHeld instead of recalculating
                 simPos.currentValue = simPos.sharesHeld * currentPrice;
             }
 
@@ -433,7 +515,6 @@ async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
             unrealizedPnl += simPos.pnl;
             totalCurrentValue += simPos.currentValue;
         } else {
-            // Closed position - P&L already calculated
             realizedPnl += simPos.pnl;
         }
     }
@@ -446,15 +527,16 @@ async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
 
     const totalPnl = currentCapital - STARTING_CAPITAL;
     const roi = (totalPnl / STARTING_CAPITAL) * 100;
+    const avgSlippagePercent = copiedTrades > 0 ? totalSlippagePercent / copiedTrades : 0;
 
     const strategyName = STRATEGY === CopyStrategy.FIXED ? 'FIXED' :
-        STRATEGY === CopyStrategy.ADAPTIVE ? 'ADAPTIVE' : 'PERCENTAGE';
+                        STRATEGY === CopyStrategy.ADAPTIVE ? 'ADAPTIVE' : 'PERCENTAGE';
     const copySizeLabel = STRATEGY === CopyStrategy.FIXED ? `${COPY_SIZE}usd` : `${COPY_SIZE}pct`;
 
     return {
-        id: `sim_${TRADER_ADDRESS.slice(0, 8)}_${Date.now()}`,
-        name: `${strategyName}_${TRADER_ADDRESS.slice(0, 6)}_${HISTORY_DAYS}d_${copySizeLabel}`,
-        logic: STRATEGY.toLowerCase(),
+        id: `sim_realistic_${TRADER_ADDRESS.slice(0, 8)}_${Date.now()}`,
+        name: `${strategyName}_${TRADER_ADDRESS.slice(0, 6)}_${HISTORY_DAYS}d_${copySizeLabel}_realistic`,
+        logic: `${STRATEGY.toLowerCase()}_realistic`,
         timestamp: Date.now(),
         traderAddress: TRADER_ADDRESS,
         startingCapital: STARTING_CAPITAL,
@@ -468,13 +550,15 @@ async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
         unrealizedPnl,
         totalPnl,
         roi,
+        totalSlippageCost,
+        avgSlippagePercent,
         positions: Array.from(positions.values()),
     };
 }
 
 function printReport(result: SimulationResult) {
     console.log('\n' + colors.cyan('═'.repeat(80)));
-    console.log(colors.cyan(`  📊 COPY TRADING SIMULATION REPORT (${STRATEGY} STRATEGY)`));
+    console.log(colors.cyan(`  📊 REALISTIC COPY TRADING SIMULATION REPORT`));
     console.log(colors.cyan('═'.repeat(80)) + '\n');
 
     console.log('Trader:', colors.blue(result.traderAddress));
@@ -492,15 +576,18 @@ function printReport(result: SimulationResult) {
             colors.yellow(`${COPY_SIZE}%`),
             colors.gray('(of trader order size)')
         );
-    } else {
-        console.log(
-            'Copy Size:',
-            colors.yellow(`${COPY_SIZE}%`),
-            colors.gray('(adaptive strategy)')
-        );
     }
 
-    console.log('Multiplier:', colors.yellow(`${MULTIPLIER}x`));
+    console.log();
+    console.log(colors.bold('Realism Factors:'));
+    console.log(`  Detection delay: ${colors.yellow(DETECTION_DELAY_SECONDS + 's')}`);
+    console.log(`  Base slippage: ${colors.yellow(BASE_SLIPPAGE_PERCENT + '%')}`);
+    console.log(`  Slippage per $100: ${colors.yellow('+' + SLIPPAGE_PER_100USD + '%')}`);
+    console.log(`  Avg actual slippage: ${colors.yellow(result.avgSlippagePercent.toFixed(2) + '%')}`);
+    console.log(`  Total slippage cost: ${colors.red('$' + result.totalSlippageCost.toFixed(2))}`);
+    if (TRANSACTION_FEE_PERCENT > 0) {
+        console.log(`  Transaction fee: ${colors.yellow(TRANSACTION_FEE_PERCENT + '%')}`);
+    }
     console.log();
 
     console.log(colors.bold('Capital:'));
@@ -575,10 +662,15 @@ function printReport(result: SimulationResult) {
     }
 
     console.log('\n' + colors.cyan('═'.repeat(80)) + '\n');
+
+    // Comparison suggestion
+    console.log(colors.yellow('💡 TIP: Compare with original simulation:'));
+    console.log(colors.gray('   npm run simulate'));
+    console.log(colors.gray('   This will show how much slippage and delay impact returns\n'));
 }
 
 async function main() {
-    console.log(colors.cyan('\n🚀 POLYMARKET COPY TRADING PROFITABILITY SIMULATOR\n'));
+    console.log(colors.cyan('\n🚀 REALISTIC COPY TRADING SIMULATION\n'));
     console.log(colors.gray(`Trader: ${TRADER_ADDRESS}`));
     console.log(colors.gray(`Starting Capital: $${STARTING_CAPITAL}`));
     console.log(colors.gray(`Strategy: ${STRATEGY}`));
@@ -587,8 +679,6 @@ async function main() {
         console.log(colors.gray(`Copy Size: $${COPY_SIZE} (fixed per trade)`));
     } else if (STRATEGY === CopyStrategy.PERCENTAGE) {
         console.log(colors.gray(`Copy Size: ${COPY_SIZE}% (of trader order size)`));
-    } else {
-        console.log(colors.gray(`Copy Size: ${COPY_SIZE}% (adaptive)`));
     }
 
     console.log(colors.gray(`Multiplier: ${MULTIPLIER}x`));
@@ -617,13 +707,13 @@ async function main() {
         })();
         const strategyName = STRATEGY.toLowerCase();
         const copySizeLabel = STRATEGY === CopyStrategy.FIXED ? `${COPY_SIZE}usd` : `${COPY_SIZE}pct`;
-        const filename = `${strategyName}_${TRADER_ADDRESS}_${HISTORY_DAYS}d_${copySizeLabel}${tag}_${new Date().toISOString().split('T')[0]}.json`;
+        const filename = `${strategyName}_${TRADER_ADDRESS}_${HISTORY_DAYS}d_${copySizeLabel}_realistic${tag}_${new Date().toISOString().split('T')[0]}.json`;
         const filepath = path.join(resultsDir, filename);
 
         fs.writeFileSync(filepath, JSON.stringify(result, null, 2), 'utf8');
         console.log(colors.green(`✓ Results saved to: ${filepath}\n`));
 
-        console.log(colors.green('✓ Simulation completed successfully!\n'));
+        console.log(colors.green('✓ Realistic simulation completed!\n'));
     } catch (error) {
         console.error(colors.red('\n✗ Simulation failed:'), error);
         process.exit(1);

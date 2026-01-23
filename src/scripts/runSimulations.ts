@@ -23,8 +23,8 @@ interface SimulationConfig {
 }
 
 const DEFAULT_TRADERS = [
-    '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b',
-    '0x6bab41a0dc40d6dd4c1a915b8c01969479fd1292',
+    '0xe9c6312464b52aa3eff13d822b003282075995c9',
+    // '0x6bab41a0dc40d6dd4c1a915b8c01969479fd1292',
 ];
 
 const PRESETS = {
